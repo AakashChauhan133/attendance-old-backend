@@ -1,0 +1,20 @@
+services:
+  backend:
+    build: .
+    container_name: biometric_backend
+    restart: always
+    environment:
+      - PROJECT_NAME=BioMetric
+      - DATABASE_URL=postgresql+asyncpg://grid:strongpassword@172.17.0.1:5432/biometric
+      - REDIS_URL=redis://172.17.0.1:6379/0
+      - MQTT_BROKER=187.127.141.155
+      - MQTT_PORT=1883
+      - MQTT_USER=esp8266
+      - MQTT_PASS=strongpassword123
+    ports:
+      - "9000:8000"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
