@@ -5,5 +5,7 @@ from app.api.routes.org_admin import (
     attendance,
     leaves,
     holidays,
-    devices, # ← ADD THIS
+    devices, # ← ADD THIS,
+    activity,
+    settings,
 )

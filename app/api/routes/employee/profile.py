@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
+from sqlalchemy import text, func
 from pydantic import BaseModel
 from app.db.session import get_db
 from app.api.dependencies import get_current_user
 from app.models.domain import User
-from app.core.security import verify_password, hash_password
+from app.core.security import verify_password, hash_password, validate_password_strength
 
 router = APIRouter()
 
@@ -75,7 +75,7 @@ async def update_profile(
         # Check if email is already taken
         from sqlalchemy.future import select
         existing = await db.execute(
-            select(User).where(User.email == data.email, User.id != current_user.id)
+            select(User).where(func.lower(User.email) == data.email.lower(), User.id != current_user.id)
         )
         if existing.scalars().first():
             raise HTTPException(400, "Email already in use")
@@ -109,7 +109,14 @@ async def change_password(
     if not verify_password(data.old_password, current_user.password_hash):
         raise HTTPException(401, "Incorrect current password")
     
+    ok, msg = validate_password_strength(data.new_password)
+    if not ok:
+        raise HTTPException(400, msg)
+    if verify_password(data.new_password, current_user.password_hash):
+        raise HTTPException(400, "New password must be different from the current one")
+    
     current_user.password_hash = hash_password(data.new_password)
+    await db.execute(text("UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = :u"), {"u": current_user.id})
     await db.commit()
     
     return {"message": "Password updated successfully"}

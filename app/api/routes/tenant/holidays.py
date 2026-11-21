@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from datetime import date
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant
 
 router = APIRouter()
@@ -33,7 +34,7 @@ class HolidayUpdate(BaseModel):
 @router.get("/holidays")
 async def list_holidays(
     year: int = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: List all holidays"""
@@ -59,22 +60,25 @@ async def list_holidays(
 @router.post("/holidays")
 async def create_holiday(
     data: HolidayCreate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Create a new holiday"""
     
-    await db.execute(text("""
-        INSERT INTO holidays (tenant_id, name, holiday_date, description)
-        VALUES (:tenant_id, :name, :holiday_date, :description)
-    """), {
-        "tenant_id": tenant.id,
-        "name": data.name,
-        "holiday_date": data.holiday_date,
-        "description": data.description
-    })
-    
-    await db.commit()
+    try:
+        await db.execute(text("""
+            INSERT INTO holidays (tenant_id, name, holiday_date, description)
+            VALUES (:tenant_id, :name, :holiday_date, :description)
+        """), {
+            "tenant_id": tenant.id,
+            "name": data.name,
+            "holiday_date": data.holiday_date,
+            "description": data.description
+        })
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(400, "A holiday already exists on that date")
     
     return {"message": "Holiday created successfully"}
 
@@ -83,30 +87,34 @@ async def create_holiday(
 async def update_holiday(
     holiday_id: int,
     data: HolidayUpdate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Update a holiday"""
     
-    result = await db.execute(text("""
-        UPDATE holidays
-        SET name = :name,
-            holiday_date = :holiday_date,
-            description = :description
-        WHERE holiday_id = :holiday_id
-        AND tenant_id = :tenant_id
-    """), {
-        "holiday_id": holiday_id,
-        "tenant_id": tenant.id,
-        "name": data.name,
-        "holiday_date": data.holiday_date,
-        "description": data.description
-    })
-    
-    if result.rowcount == 0:
-        raise HTTPException(404, "Holiday not found")
-    
-    await db.commit()
+    try:
+        result = await db.execute(text("""
+            UPDATE holidays
+            SET name = :name,
+                holiday_date = :holiday_date,
+                description = :description
+            WHERE holiday_id = :holiday_id
+            AND tenant_id = :tenant_id
+        """), {
+            "holiday_id": holiday_id,
+            "tenant_id": tenant.id,
+            "name": data.name,
+            "holiday_date": data.holiday_date,
+            "description": data.description
+        })
+        
+        if result.rowcount == 0:
+            raise HTTPException(404, "Holiday not found")
+        
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(400, "A holiday already exists on that date")
     
     return {"message": "Holiday updated successfully"}
 
@@ -114,7 +122,7 @@ async def update_holiday(
 @router.delete("/holidays/{holiday_id}")
 async def delete_holiday(
     holiday_id: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Delete a holiday"""
@@ -139,7 +147,7 @@ async def delete_holiday(
 @router.get("/holidays/upcoming")
 async def upcoming_holidays(
     limit: int = 5,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get upcoming holidays"""

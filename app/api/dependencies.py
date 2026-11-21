@@ -41,77 +41,20 @@ async def get_current_user(
 
 async def get_current_active_identity(
     token: str = Depends(oauth2_scheme),
-    x_api_key: str = Header(None, alias="X-API-Key"),
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    POLYMORPHIC IDENTITY:
-    Allows shared routes (like notifications) to be accessed by either 
-    an Employee (via JWT) or a Tenant Admin (via API Key).
-    """
-    # 1. Check for JWT (Frontend UI Users)
-    if token:
-        try:
-            payload = decode_token(token)
-            if payload and payload.get("type") == "access":
-                user_id = payload.get("user_id")
-                result = await db.execute(select(User).where(User.id == user_id))
-                user = result.scalars().first()
-                if user and user.is_active:
-                    return user
-        except Exception as e:
-            logger.debug(f"JWT check bypassed/failed: {e}")
-
-    # 2. Check for API Key (Tenant Managers / Direct API hits)
-    if x_api_key:
-        result = await db.execute(select(Tenant).where(Tenant.api_key == x_api_key))
-        tenant = result.scalars().first()
-        if tenant:
-            return tenant
-
-    # 3. Fallback
-    raise HTTPException(
-        status_code=401, 
-        detail="Valid authentication (JWT or API Key) required for this resource"
-    )
+    """Any logged-in, active user (JWT) - used by shared routes such as notifications."""
+    payload = decode_token(token)
+    if payload and payload.get("type") == "access":
+        result = await db.execute(select(User).where(User.id == payload.get("user_id")))
+        user = result.scalars().first()
+        if user and user.is_active:
+            return user
+    raise HTTPException(status_code=401, detail="Valid authentication required for this resource")
 
 # =================================================================
 # 2. ROLE-BASED ACCESS CONTROL (RBAC)
 # =================================================================
-
-async def get_current_tenant(
-    token: str = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(get_db)
-) -> Tenant:
-    """
-    Get current tenant from JWT token.
-    Used for tenant endpoints that require JWT auth.
-    """
-    payload = decode_token(token)
-    
-    if not payload:
-        raise HTTPException(401, "Invalid or expired token")
-    
-    if payload.get("type") != "access":
-        raise HTTPException(401, "Invalid token type")
-    
-    # Verify this is a tenant token
-    if payload.get("role") != "tenant_admin":
-        raise HTTPException(403, "Tenant access required")
-    
-    tenant_id = payload.get("tenant_id")
-    
-    if not tenant_id:
-        raise HTTPException(401, "Invalid token payload")
-    
-    # Fetch tenant from database
-    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
-    tenant = result.scalars().first()
-    
-    if not tenant:
-        raise HTTPException(401, "Tenant not found")
-    
-    return tenant
 
 def require_role(*allowed_roles: str):
     """Generic role requirement decorator"""
@@ -140,24 +83,13 @@ async def require_employee(current_user: User = Depends(get_current_user)) -> Us
 # 3. TENANT & ORGANIZATION VALIDATION
 # =================================================================
 
-async def verify_tenant_api_key(
-    x_api_key: str = Header(..., alias="X-API-Key"),
-    db: AsyncSession = Depends(get_db)
-) -> Tenant:
-    """Strictly validates via Header API Key"""
-    result = await db.execute(select(Tenant).where(Tenant.api_key == x_api_key))
-    tenant = result.scalars().first()
-    if not tenant:
-        raise HTTPException(401, "Invalid API key")
-    return tenant
-
-async def verify_tenant_jwt(
+async def require_tenant_admin(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Tenant:
-    """Validates that a logged-in user is a tenant admin and returns the tenant object"""
-    if current_user.role != "tenant_admin":
-        raise HTTPException(403, "Tenant access required")
+    """Tenant manager access: a logged-in user with role 'tenant_admin'. Returns the user's Tenant."""
+    if current_user.role != "tenant_admin" or not current_user.tenant_id:
+        raise HTTPException(403, "Tenant admin access required")
     result = await db.execute(select(Tenant).where(Tenant.id == current_user.tenant_id))
     tenant = result.scalars().first()
     if not tenant:

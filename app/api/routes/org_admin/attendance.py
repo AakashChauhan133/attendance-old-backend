@@ -314,5 +314,78 @@ async def attendance_by_date(
         )
 
 
-# ... (rest of the endpoints - summary and employee history remain the same 
+# ... (rest of the endpoints - summary and employee history remain the same
 # but also need similar timezone fixes)
+
+
+@router.get("/attendance")
+async def attendance_for_date(
+    date: Optional[date] = None,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Org Admin: Attendance for a date given as ?date=YYYY-MM-DD (defaults to today, IST).
+    Same payload as /attendance/date/{attendance_date}.
+    """
+    target = date or datetime.now(IST).date()
+    return await attendance_by_date(target, current_user=current_user, db=db)
+
+@router.get("/reports/download")
+async def download_attendance_report(
+    month: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    format: str = "xlsx",
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Department admin: CSV of check-in / check-out / total time for own department.
+    ?month=YYYY-MM (1st..last day) OR ?start_date=&end_date= (custom)."""
+    from app.services.attendance_report_service import resolve_range, respond
+    start, end = resolve_range(month, start_date, end_date)
+    if current_user.dept_id is None:
+        raise HTTPException(400, "Your account is not linked to a department")
+    return await respond(db, current_user.tenant_id, start, end, current_user.dept_id, format)
+
+
+@router.get("/reports/summary")
+async def attendance_summary(
+    start_date: date,
+    end_date: date,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Department admin: per-employee present / late / absent counts for a date range, in one call.
+    present = on-time days, late = days whose first punch is after office start + late threshold,
+    absent = calendar days in the range without any punch."""
+    from sqlalchemy import text as _text
+    from app.services.attendance_report_service import resolve_range, build_report, _employees
+    start, end = resolve_range(None, start_date, end_date)
+    if current_user.dept_id is None:
+        raise HTTPException(400, "Your account is not linked to a department")
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    dep = await db.execute(_text("SELECT department_name FROM departments WHERE department_id = :d"),
+                           {"d": current_user.dept_id})
+    dept_name = dep.scalar() or "Department"
+    employees = await _employees(db, current_user.tenant_id, current_user.dept_id)
+    rows = await build_report(db, current_user.tenant_id, start, end, current_user.dept_id)
+    total_days = (end - start).days + 1
+    stats = {e["id"]: {"present": 0, "late": 0} for e in employees}
+    for r in rows:
+        st = stats.get(r["user_id"])
+        if st is None or not r["check_in"]:
+            continue
+        is_late, _ = calculate_late_status(r["check_in"], settings)
+        st["late" if is_late else "present"] += 1
+    out = []
+    for e in employees:
+        st = stats[e["id"]]
+        attended = st["present"] + st["late"]
+        out.append({
+            "id": e["id"], "name": e["name"], "employee_code": e["employee_code"], "department": dept_name,
+            "present": st["present"], "late": st["late"], "absent": total_days - attended,
+            "attendance_rate": round(attended / total_days * 100, 1),
+        })
+    return {"department": dept_name, "start_date": start.isoformat(), "end_date": end.isoformat(),
+            "total_days": total_days, "employees": out}

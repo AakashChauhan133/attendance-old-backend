@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, insert
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 from datetime import date
 from typing import Optional
 from app.db.session import get_db
@@ -11,11 +11,30 @@ from app.models.domain import User, Notification
 router = APIRouter()
 
 
+LEAVE_TYPES = ("sick", "casual", "earned")
+
+
 class LeaveApplyRequest(BaseModel):
     leave_type: str
     start_date: date
     end_date: date
     reason: Optional[str] = None
+
+    @field_validator("leave_type")
+    @classmethod
+    def _valid_type(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in LEAVE_TYPES:
+            raise ValueError(f"leave_type must be one of: {', '.join(LEAVE_TYPES)}")
+        return v
+
+    @model_validator(mode="after")
+    def _valid_range(self):
+        if self.end_date < self.start_date:
+            raise ValueError("end_date cannot be before start_date")
+        if (self.end_date - self.start_date).days > 365:
+            raise ValueError("a leave request cannot span more than 365 days")
+        return self
 
 
 async def create_leave_notifications_bg(

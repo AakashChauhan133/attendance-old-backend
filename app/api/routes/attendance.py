@@ -106,7 +106,9 @@ async def sync_offline_attendance(
     return {"status": "success", "synced_records": count}
 
 
-@router.get("/history", response_model=List[AttendanceLogResponse])
+# the service returns per-day summaries (date, check_in/out, hours), not raw punches, so no
+# AttendanceLogResponse model here (it made every call with data fail with a 500)
+@router.get("/history")
 async def attendance_history(
     device = Depends(verify_device),
     db: AsyncSession = Depends(get_db)

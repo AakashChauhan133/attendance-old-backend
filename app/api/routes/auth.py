@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import text, or_
+from sqlalchemy import text, or_, func
 from app.db.session import get_db
 from app.models.domain import User, RefreshToken, Tenant
 from app.api.dependencies import get_current_user
@@ -14,7 +14,7 @@ from app.core.security import (
     create_refresh_token,
     decode_token
 )
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import secrets
 import re
 import logging
@@ -33,11 +33,6 @@ class LoginRequest(BaseModel):
     identifier: str
     password: str
     tenant_id: int | None = None
-
-
-class TenantLoginRequest(BaseModel):
-    """Tenant manager login using API key"""
-    api_key: str
 
 
 class RefreshRequest(BaseModel):
@@ -141,14 +136,17 @@ async def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db)
 ):
-    """Unified login for ALL users (Super Admin, Org Admin, Employee, Tenant)"""
+    """Unified login for ALL users (Super Admin, Tenant Admin, Org Admin, Employee): email or employee code + password"""
+    
+    if "\x00" in form_data.username or "\x00" in form_data.password:
+        raise HTTPException(401, "Invalid credentials")  # NUL bytes cannot be stored/compared; not a server error
     
     try:
-        # 1. Try Users table (Super Admin, Org Admin, Employee)
+        # Users table (Super Admin, Tenant Admin, Org Admin, Employee)
         query = select(User).where(
             or_(
                 User.employee_code == form_data.username,
-                User.email == form_data.username
+                func.lower(User.email) == form_data.username.strip().lower()
             )
         )
         result = await db.execute(query)
@@ -162,31 +160,9 @@ async def login(
                 raise HTTPException(403, "Account is deactivated")
             
             logger.info(f"User login: {user.email or user.employee_code} ({user.role})")
-            return _create_auth_response(user, db)
-        
-        # 2. Try API Key (Tenant Manager)
-        result = await db.execute(
-            select(Tenant).where(Tenant.api_key == form_data.password)
-        )
-        tenant = result.scalars().first()
-        
-        if tenant:
-            payload = {
-                "user_id": tenant.id,
-                "role": "tenant_admin",
-                "tenant_id": tenant.id
-            }
-            
-            access_token = create_access_token(payload)
-            refresh_token, jti = create_refresh_token(payload)
-            
-            logger.info(f"Tenant login via API key: {tenant.name}")
-            
-            return {
-                "access_token": access_token,
-                "refresh_token": refresh_token,
-                "token_type": "bearer"
-            }
+            response = _create_auth_response(user, db)
+            await db.commit()  # persist the refresh token so /refresh and /logout can find it
+            return response
         
         logger.warning(f"Failed login: {form_data.username}")
         raise HTTPException(401, "Invalid credentials")
@@ -202,47 +178,6 @@ async def login(
 # =========================
 # TENANT LOGIN (API Key)
 # =========================
-
-@router.post("/tenant-login")
-async def tenant_login(
-    data: TenantLoginRequest,
-    db: AsyncSession = Depends(get_db)
-):
-    """Dedicated login for tenant managers using API key"""
-    
-    try:
-        result = await db.execute(
-            select(Tenant).where(Tenant.api_key == data.api_key)
-        )
-        tenant = result.scalars().first()
-        
-        if not tenant:
-            raise HTTPException(401, "Invalid API key")
-        
-        payload = {
-            "user_id": tenant.id,
-            "role": "tenant_admin",
-            "tenant_id": tenant.id
-        }
-        
-        access_token = create_access_token(payload)
-        refresh_token, jti = create_refresh_token(payload)
-        
-        logger.info(f"Tenant login: {tenant.name}")
-        
-        return {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer",
-            "tenant": {"id": tenant.id, "name": tenant.name}
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Tenant login error: {str(e)}")
-        raise HTTPException(500, "Internal server error")
-
 
 # =========================
 # REFRESH TOKEN
@@ -274,7 +209,10 @@ async def refresh_token(
         if not token_record or token_record.is_revoked:
             raise HTTPException(401, "Token revoked or not found")
         
-        if token_record.expires_at < datetime.utcnow():
+        expires = token_record.expires_at
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires < datetime.now(timezone.utc):
             raise HTTPException(401, "Token expired")
         
         token_record.is_revoked = True
@@ -361,7 +299,7 @@ async def create_super_admin(
         
         # Check email
         email_check = await db.execute(
-            select(User).where(User.email == data.email)
+            select(User).where(func.lower(User.email) == data.email.lower())
         )
         if email_check.scalars().first():
             raise HTTPException(400, "Email already in use")
@@ -369,7 +307,7 @@ async def create_super_admin(
         # Create super admin
         user = User(
             tenant_id=None,
-            email=data.email,
+            email=data.email.lower(),
             name=data.name,
             employee_code=None,
             finger_id=None,
@@ -418,6 +356,7 @@ async def change_password(
             raise HTTPException(401, "Incorrect current password")
         
         current_user.password_hash = hash_password(data.new_password)
+        await db.execute(text("UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = :u"), {"u": current_user.id})
         await db.commit()
         
         logger.info(f"Password changed for user: {current_user.id}")
@@ -441,19 +380,30 @@ async def set_password(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Admin sets password for a user"""
+    """Admin sets password for a user.
+
+    super_admin: any user. tenant_admin: org admins and employees of own tenant.
+    org_admin: employees of own department. Anything else looks like "User not found".
+    """
     
-    if current_user.role not in ["super_admin", "org_admin"]:
+    if current_user.role not in ["super_admin", "tenant_admin", "org_admin"]:
         raise HTTPException(403, "Admin access required")
     
     try:
         result = await db.execute(select(User).where(User.id == data.user_id))
         user = result.scalars().first()
         
-        if not user:
+        allowed = bool(user)
+        if user and current_user.role == "tenant_admin":
+            allowed = (user.tenant_id == current_user.tenant_id and user.role in ("org_admin", "employee"))
+        elif user and current_user.role == "org_admin":
+            allowed = (user.tenant_id == current_user.tenant_id and user.role == "employee"
+                       and user.dept_id == current_user.dept_id)
+        if not allowed:
             raise HTTPException(404, "User not found")
         
         user.password_hash = hash_password(data.new_password)
+        await db.execute(text("UPDATE refresh_tokens SET is_revoked = TRUE WHERE user_id = :u"), {"u": user.id})
         await db.commit()
         
         return {"message": "Password set successfully"}
