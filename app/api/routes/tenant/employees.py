@@ -3,7 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from typing import Optional
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant
 
 router = APIRouter()
@@ -12,7 +12,7 @@ router = APIRouter()
 @router.get("/employees")
 async def list_all_employees(
     dept_id: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: List all employees across all departments"""
@@ -49,7 +49,7 @@ async def list_all_employees(
 @router.get("/employees/{employee_id}")
 async def get_employee_detail(
     employee_id: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get detailed employee information"""
@@ -92,7 +92,7 @@ async def get_employee_attendance(
     employee_id: int,
     month: Optional[int] = None,
     year: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: View employee's attendance history"""
@@ -131,7 +131,7 @@ async def get_employee_attendance(
 @router.get("/employees/fingerprint/{finger_id}")
 async def find_employee_by_fingerprint(
     finger_id: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Find employee by fingerprint ID"""

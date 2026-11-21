@@ -4,7 +4,7 @@ from sqlalchemy import text, select
 from typing import Optional
 from datetime import datetime
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant, LeaveBalance, LeaveSettings
 from app.services.notification_service import notify_single_user
 
@@ -15,7 +15,7 @@ router = APIRouter()
 async def list_leave_requests(
     status: Optional[str] = None,
     dept_id: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: List all leave requests"""
@@ -44,7 +44,7 @@ async def list_leave_requests(
 
 @router.get("/leaves/pending")
 async def pending_leaves(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get pending leave requests count"""
@@ -59,7 +59,7 @@ async def pending_leaves(
 @router.patch("/leaves/{leave_id}/approve")
 async def approve_leave(
     leave_id: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Approve a leave request (final approval)"""
@@ -147,7 +147,7 @@ async def approve_leave(
 async def reject_leave(
     leave_id: int,
     reason: str = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Reject a leave request"""
@@ -193,7 +193,7 @@ async def reject_leave(
 
 @router.get("/leaves/stats")
 async def leave_statistics(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get leave statistics"""
@@ -219,7 +219,7 @@ async def leave_statistics(
 async def get_leave_balances(
     year: Optional[int] = None,
     department_id: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get all leave balances for tenant"""
@@ -261,7 +261,7 @@ async def get_leave_balances(
 
 @router.get("/leave-balances/settings")
 async def get_leave_settings(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get leave settings for tenant"""
@@ -299,7 +299,7 @@ async def get_leave_settings(
 @router.put("/leave-balances/settings")
 async def update_leave_settings(
     data: dict,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Update leave settings for tenant"""
@@ -337,7 +337,7 @@ async def update_leave_settings(
 @router.post("/leave-balances/update")
 async def update_leave_balance(
     data: dict,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Update leave balance for a user"""
@@ -380,7 +380,7 @@ async def update_leave_balance(
 @router.post("/leave-balances/reset-year")
 async def reset_leave_balances(
     year: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Reset leave balances for all users for a specific year"""
@@ -438,7 +438,7 @@ async def reset_leave_balances(
 async def get_user_leave_balance(
     user_id: int,
     year: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get leave balance for a specific user"""

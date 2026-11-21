@@ -8,7 +8,7 @@ from typing import Optional, List
 from pydantic import BaseModel
 
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant
 from app.services.attendance_service import get_today_summary, get_attendance_history
 from app.services.tenant_settings_service import get_tenant_settings, calculate_valid_working_hours, calculate_late_status
@@ -37,7 +37,7 @@ class AttendanceSummaryResponse(BaseModel):
 @router.get("/attendance/today", response_model=AttendanceSummaryResponse)
 async def get_today_attendance(
     dept_id: Optional[int] = Query(None, description="Filter by department ID"),
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get today's attendance with working hours compliance"""
@@ -49,7 +49,7 @@ async def get_today_attendance(
 async def attendance_by_date(
     attendance_date: date,
     dept_id: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get attendance for a specific date with working hours"""
@@ -142,9 +142,106 @@ async def attendance_by_date(
     }
 
 
+@router.get("/attendance/recent")
+async def recent_attendance(
+    limit: int = Query(20, ge=1, le=200),
+    dept_id: Optional[int] = Query(None, description="Filter by department ID"),
+    tenant: Tenant = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Most recent check-in / check-out events"""
+
+    from sqlalchemy import text
+
+    result = await db.execute(text("""
+        SELECT
+            a.id,
+            a.user_id,
+            u.name AS name,
+            u.employee_code,
+            d.department_name,
+            a.device_id,
+            a.record_type,
+            a.timestamp
+        FROM attendance_logs a
+        LEFT JOIN users u ON u.id = a.user_id
+        LEFT JOIN departments d ON d.department_id = u.dept_id
+        WHERE a.tenant_id = :tenant_id
+          AND (CAST(:dept_id AS INTEGER) IS NULL OR u.dept_id = CAST(:dept_id AS INTEGER))
+        ORDER BY a.timestamp DESC
+        LIMIT :limit
+    """), {"tenant_id": tenant.id, "dept_id": dept_id, "limit": limit})
+
+    return result.mappings().all()
+
+
+@router.get("/attendance/stats")
+async def attendance_stats(
+    days: int = Query(7, ge=1, le=90, description="Trend window in days (incl. today)"),
+    dept_id: Optional[int] = Query(None, description="Filter by department ID"),
+    tenant: Tenant = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Attendance headline numbers for today plus a per-day trend"""
+
+    from sqlalchemy import text
+    from datetime import timedelta
+
+    params = {"tenant_id": tenant.id, "dept_id": dept_id, "days": days}
+
+    totals = await db.execute(text("""
+        SELECT COUNT(*) AS total_employees
+        FROM users u
+        WHERE u.tenant_id = :tenant_id
+          AND u.role = 'employee'
+          AND u.is_active = true
+          AND (CAST(:dept_id AS INTEGER) IS NULL OR u.dept_id = CAST(:dept_id AS INTEGER))
+    """), params)
+    total_employees = totals.scalar() or 0
+
+    trend_rows = await db.execute(text("""
+        SELECT
+            (a.timestamp AT TIME ZONE 'Asia/Kolkata')::date AS day,
+            COUNT(DISTINCT a.user_id) AS present
+        FROM attendance_logs a
+        JOIN users u ON u.id = a.user_id
+        WHERE a.tenant_id = :tenant_id
+          AND a.record_type = 'IN'
+          AND u.role = 'employee'
+          AND (CAST(:dept_id AS INTEGER) IS NULL OR u.dept_id = CAST(:dept_id AS INTEGER))
+          AND (a.timestamp AT TIME ZONE 'Asia/Kolkata')::date
+              >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date - (CAST(:days AS INTEGER) - 1)
+        GROUP BY 1
+    """), params)
+    present_by_day = {r["day"]: r["present"] for r in trend_rows.mappings().all()}
+
+    today = (await db.execute(text("SELECT (NOW() AT TIME ZONE 'Asia/Kolkata')::date"))).scalar()
+    trend = []
+    for offset in range(days - 1, -1, -1):
+        d = today - timedelta(days=offset)
+        present = present_by_day.get(d, 0)
+        trend.append({
+            "date": d,
+            "present": present,
+            "absent": max(total_employees - present, 0),
+            "attendance_rate": round(present / total_employees * 100, 1) if total_employees else 0
+        })
+
+    present_today = present_by_day.get(today, 0)
+    return {
+        "date": today,
+        "total_employees": total_employees,
+        "present_today": present_today,
+        "absent_today": max(total_employees - present_today, 0),
+        "attendance_rate_today": round(present_today / total_employees * 100, 1) if total_employees else 0,
+        "average_attendance_rate": round(sum(t["attendance_rate"] for t in trend) / len(trend), 1) if trend else 0,
+        "trend": trend
+    }
+
+
 @router.get("/attendance/settings")
 async def get_attendance_settings(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get attendance-related settings for the tenant"""

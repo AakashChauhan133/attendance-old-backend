@@ -4,7 +4,7 @@ from sqlalchemy.future import select
 from sqlalchemy import text
 from pydantic import BaseModel
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant, Department, User
 
 router = APIRouter()
@@ -28,7 +28,7 @@ class DepartmentUpdate(BaseModel):
 
 @router.get("/departments")
 async def list_departments(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: List all departments with stats"""
@@ -54,7 +54,7 @@ async def list_departments(
 @router.post("/departments")
 async def create_department(
     data: DepartmentCreate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Create a new department"""
@@ -91,7 +91,7 @@ async def create_department(
 async def update_department(
     department_id: int,
     data: DepartmentUpdate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Update department"""
@@ -113,10 +113,54 @@ async def update_department(
     return {"message": "Department updated successfully"}
 
 
+class DepartmentStatusUpdate(BaseModel):
+    is_active: bool | None = None
+    status: str | None = None  # alternative: "active" | "inactive"
+
+
+@router.patch("/departments/{department_id}/status")
+async def update_department_status(
+    department_id: int,
+    data: DepartmentStatusUpdate,
+    tenant: Tenant = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant Manager: Activate or deactivate a department ({"is_active": true|false})"""
+
+    if data.is_active is not None:
+        is_active = data.is_active
+    elif data.status is not None:
+        if data.status.lower() not in ("active", "inactive"):
+            raise HTTPException(400, "status must be 'active' or 'inactive'")
+        is_active = data.status.lower() == "active"
+    else:
+        raise HTTPException(400, "Provide is_active (true/false) or status ('active'/'inactive')")
+
+    result = await db.execute(
+        select(Department).where(
+            Department.department_id == department_id,
+            Department.tenant_id == tenant.id
+        )
+    )
+    department = result.scalars().first()
+
+    if not department:
+        raise HTTPException(404, "Department not found")
+
+    department.is_active = is_active
+    await db.commit()
+
+    return {
+        "message": f"Department {'activated' if is_active else 'deactivated'} successfully",
+        "department_id": department.department_id,
+        "is_active": department.is_active
+    }
+
+
 @router.delete("/departments/{department_id}")
 async def delete_department(
     department_id: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Delete department (only if empty)"""

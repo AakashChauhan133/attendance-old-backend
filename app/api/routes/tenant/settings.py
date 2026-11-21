@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Header, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from sqlalchemy.future import select
@@ -9,7 +9,7 @@ import logging
 from datetime import datetime
 
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key, oauth2_scheme_optional
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant
 from app.core.security import decode_token
 
@@ -61,24 +61,6 @@ class SettingsUpdate(BaseModel):
         for day in days:
             if not day.strip().isdigit() or int(day) < 1 or int(day) > 7:
                 raise ValueError(f'Invalid working day: {day}. Must be 1-7')
-        return v
-
-
-class ChangeApiKeyRequest(BaseModel):
-    """Change API key request - password-like validation"""
-    api_key: str
-    
-    @field_validator('api_key')
-    @classmethod
-    def validate_api_key(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError('API key must be at least 8 characters')
-        if not re.search(r'[A-Z]', v):
-            raise ValueError('API key must contain at least one uppercase letter')
-        if not re.search(r'[a-z]', v):
-            raise ValueError('API key must contain at least one lowercase letter')
-        if not re.search(r'[0-9]', v):
-            raise ValueError('API key must contain at least one number')
         return v
 
 
@@ -196,7 +178,7 @@ async def get_tenant_settings_from_db(
 
 @router.get("/settings", response_model=SettingsResponse)
 async def get_settings(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get organization settings"""
@@ -216,7 +198,7 @@ async def get_settings(
 @router.put("/settings")
 async def update_settings(
     data: SettingsUpdate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Update organization settings"""
@@ -284,7 +266,7 @@ async def update_settings(
 
 @router.get("/profile")
 async def get_tenant_profile(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get own profile"""
@@ -295,7 +277,6 @@ async def get_tenant_profile(
     return {
         "id": tenant.id,
         "name": tenant.name,
-        "api_key": tenant.api_key,
         "created_at": tenant.created_at,
         "settings": {
             "office_start_time": settings["office_start_time"],
@@ -355,11 +336,18 @@ async def get_public_settings(
 async def get_bulk_settings(
     tenant_ids: str = Query(..., description="Comma-separated tenant IDs"),
     db: AsyncSession = Depends(get_db),
-    tenant: Tenant = Depends(verify_tenant_api_key)  # Requires tenant admin access
+    tenant: Tenant = Depends(require_tenant_admin)  # Requires tenant admin access
 ):
-    """Get settings for multiple tenants (useful for super admin dashboards)"""
+    """Get settings for the given tenant ids - a tenant manager may only request its own tenant"""
     
-    ids = [int(id.strip()) for id in tenant_ids.split(',')]
+    try:
+        ids = [int(id.strip()) for id in tenant_ids.split(',') if id.strip()]
+    except ValueError:
+        raise HTTPException(400, "tenant_ids must be a comma-separated list of numbers")
+    if not ids:
+        raise HTTPException(400, "tenant_ids is required")
+    if any(i != tenant.id for i in ids):
+        raise HTTPException(403, "You can only read the settings of your own organization")
     
     result = await db.execute(text("""
         SELECT 
@@ -402,7 +390,7 @@ async def get_bulk_settings(
 @router.post("/settings/validate")
 async def validate_settings(
     data: SettingsUpdate,
-    tenant: Tenant = Depends(verify_tenant_api_key)
+    tenant: Tenant = Depends(require_tenant_admin)
 ):
     """Validate settings without saving them"""
     
@@ -418,149 +406,3 @@ async def validate_settings(
             "min_working_hours": data.min_working_hours
         }
     }
-
-
-# =========================
-# UPDATED CHANGE API KEY ENDPOINT
-# =========================
-
-@router.post("/change-api-key")
-async def change_api_key(
-    data: ChangeApiKeyRequest,
-    x_api_key: str = Header(None, alias="X-API-Key"),
-    token: str = Depends(oauth2_scheme_optional),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Tenant changes own API key.
-    Accepts BOTH:
-    - API Key authentication (X-API-Key header) - for existing API key users
-    - JWT Bearer token authentication - for users logged in via /tenant-login
-    
-    This allows tenants to change their API key regardless of how they authenticated.
-    """
-    
-    try:
-        tenant = None
-        
-        # Method 1: Try API Key from header (X-API-Key)
-        if x_api_key:
-            result = await db.execute(
-                select(Tenant).where(Tenant.api_key == x_api_key)
-            )
-            tenant = result.scalars().first()
-            if tenant:
-                logger.info(f"Tenant authenticated via API key: {tenant.id} ({tenant.name})")
-        
-        # Method 2: Try JWT Bearer token
-        if not tenant and token:
-            payload = decode_token(token)
-            if payload and payload.get("type") == "access":
-                # Verify this is a tenant token
-                if payload.get("role") == "tenant_admin":
-                    tenant_id = payload.get("tenant_id")
-                    if tenant_id:
-                        result = await db.execute(
-                            select(Tenant).where(Tenant.id == tenant_id)
-                        )
-                        tenant = result.scalars().first()
-                        if tenant:
-                            logger.info(f"Tenant authenticated via JWT: {tenant.id} ({tenant.name})")
-        
-        # No valid authentication found
-        if not tenant:
-            logger.warning("Change API key attempt - no valid authentication")
-            raise HTTPException(401, "Unauthorized - Valid API key or JWT token required")
-        
-        # Store old key for logging
-        old_key_preview = tenant.api_key[:8] + "..." if tenant.api_key else "None"
-        
-        # Update API key with the provided value
-        tenant.api_key = data.api_key
-        await db.commit()
-        
-        logger.info(f"API key changed for tenant: {tenant.id} ({tenant.name})")
-        logger.warning(f"Old key: {old_key_preview}, New key: {data.api_key[:8]}...")
-        
-        # Invalidate settings cache (though API key change doesn't affect settings)
-        invalidate_settings_cache(tenant.id)
-        
-        return {
-            "message": "API key changed successfully",
-            "tenant_id": tenant.id,
-            "tenant_name": tenant.name
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Change API key error: {str(e)}")
-        await db.rollback()
-        raise HTTPException(500, "Internal server error")
-
-
-# =========================
-# UTILITY ENDPOINT - Clear Settings Cache (for debugging)
-# =========================
-
-@router.post("/settings/clear-cache")
-async def clear_settings_cache(
-    tenant: Tenant = Depends(verify_tenant_api_key)
-):
-    """Clear cached settings for this tenant (useful for debugging)"""
-    invalidate_settings_cache(tenant.id)
-    return {"message": f"Cache cleared for tenant {tenant.id}"}
-
-
-# =========================
-# SETTINGS HISTORY (Optional - if you want to track changes)
-# =========================
-
-@router.get("/settings/history")
-async def get_settings_history(
-    limit: int = 10,
-    tenant: Tenant = Depends(verify_tenant_api_key),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    Get settings change history (requires a settings_history table)
-    This is a placeholder - implement if you want to track changes over time
-    """
-    # Note: You'd need to create a settings_history table first
-    # For now, return a message
-    return {
-        "message": "Settings history feature requires additional database table",
-        "suggestion": "Create settings_history table to track changes"
-    }
-
-
-@router.get("/settings/public")
-async def get_public_settings(
-    tenant_id: int = Query(..., description="Tenant ID"),
-    db: AsyncSession = Depends(get_db)
-):
-    """
-    PUBLIC ENDPOINT - No authentication required.
-    Get tenant settings by tenant_id.
-    Anyone from the same company can access this.
-    """
-    try:
-        from app.services.tenant_settings_service import get_tenant_settings
-        settings = await get_tenant_settings(tenant_id, db)
-        
-        return {
-            "office_start_time": settings["office_start_time"],
-            "office_end_time": settings["office_end_time"],
-            "late_threshold_minutes": settings["late_threshold_minutes"],
-            "min_working_hours": settings["min_working_hours"],
-            "working_days": settings["working_days"]
-        }
-    except Exception as e:
-        logger.error(f"Failed to fetch public settings: {e}")
-        return {
-            "office_start_time": "09:00:00",
-            "office_end_time": "18:00:00",
-            "late_threshold_minutes": 15,
-            "min_working_hours": 9.0,
-            "working_days": "1,2,3,4,5"
-        }

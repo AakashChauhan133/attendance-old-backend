@@ -1,3 +1,5 @@
+from typing import Optional
+from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, insert
@@ -115,3 +117,69 @@ async def approve_leave(
     )
     
     return {"message": "Leave approved at department level"}
+
+
+class RejectLeaveRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.patch("/leaves/{leave_id}/reject")
+async def reject_leave(
+    leave_id: int,
+    data: Optional[RejectLeaveRequest] = None,
+    reason: Optional[str] = None,
+    current_user: User = Depends(require_role("org_admin")),
+    db: AsyncSession = Depends(get_db)
+):
+    """Org Admin: Reject a leave request from own department (reason in JSON body or ?reason=)"""
+    reason = (data.reason if data and data.reason else reason) or None
+
+    leave_info = await db.execute(text("""
+        SELECT l.employee_id, l.leave_type, l.start_date, l.end_date, l.status
+        FROM leaves l
+        JOIN users u ON l.employee_id = u.id
+        WHERE l.leave_id = :leave_id
+        AND l.tenant_id = :tenant_id
+        AND u.dept_id = :dept_id
+    """), {
+        "leave_id": leave_id,
+        "tenant_id": current_user.tenant_id,
+        "dept_id": current_user.dept_id
+    })
+    info = leave_info.mappings().first()
+
+    if not info:
+        raise HTTPException(404, "Leave request not found or not in your department")
+
+    if info["status"] not in ("pending", "approved_by_dept"):
+        raise HTTPException(400, f"Leave request is already {info['status']}")
+
+    await db.execute(text("""
+        UPDATE leaves
+        SET status = 'rejected', rejection_reason = :reason, rejected_at = NOW()
+        WHERE leave_id = :leave_id AND tenant_id = :tenant_id
+    """), {"leave_id": leave_id, "tenant_id": current_user.tenant_id, "reason": reason})
+
+    message = (
+        f"Your {info['leave_type']} leave from {info['start_date']} to {info['end_date']} "
+        f"was rejected by department head"
+    )
+    if reason:
+        message += f". Reason: {reason}"
+
+    db.add(Notification(
+        tenant_id=current_user.tenant_id,
+        actor_id=current_user.id,
+        actor_name="Department Head",
+        recipient_id=info["employee_id"],
+        event_type="leave_rejected_dept",
+        entity_type="Leave",
+        entity_id=leave_id,
+        entity_name=f"{info['leave_type']} leave",
+        title="Leave Rejected (Department)",
+        message=message,
+        is_read=False
+    ))
+    await db.commit()
+
+    return {"message": "Leave rejected"}

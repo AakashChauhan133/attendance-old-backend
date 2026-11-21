@@ -94,3 +94,8 @@ combined_project_code_*.txt
 check.py
 combined_project_code.txt
 combined_project_code_*.txt
+
+# QA artifacts (real-data fingerprints / results)
+qa-tests/public_fingerprint.json
+qa-tests/api_results.json
+qa-tests/__pycache__/

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant
 
 router = APIRouter()
@@ -10,7 +10,7 @@ router = APIRouter()
 
 @router.get("/dashboard")
 async def tenant_dashboard(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: View organization dashboard"""

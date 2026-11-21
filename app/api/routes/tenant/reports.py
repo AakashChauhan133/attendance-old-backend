@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from typing import Optional
 from datetime import date
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant
 
 router = APIRouter()
@@ -15,7 +15,7 @@ async def attendance_report(
     start_date: date,
     end_date: date,
     dept_id: Optional[int] = None,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Generate attendance report for date range"""
@@ -60,7 +60,7 @@ async def attendance_report(
 async def department_summary(
     month: int,
     year: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get department-wise attendance summary"""
@@ -107,7 +107,7 @@ async def export_report(
     report_type: str,
     start_date: date,
     end_date: date,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Export report data"""
@@ -121,3 +121,24 @@ async def export_report(
             "end": end_date
         }
     }
+
+@router.get("/reports/attendance/download")
+async def download_attendance_report(
+    month: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    dept_id: Optional[int] = None,
+    format: str = "xlsx",
+    tenant: Tenant = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Tenant (organisation) admin: CSV of check-in / check-out / total time per employee per day.
+    ?month=YYYY-MM (1st..last day) OR ?start_date=&end_date= (custom); optional ?dept_id=."""
+    from app.services.attendance_report_service import resolve_range, respond
+    start, end = resolve_range(month, start_date, end_date)
+    if dept_id is not None:
+        ok = await db.execute(text("SELECT 1 FROM departments WHERE department_id = :d AND tenant_id = :t"),
+                              {"d": dept_id, "t": tenant.id})
+        if not ok.first():
+            raise HTTPException(404, "Department not found")
+    return await respond(db, tenant.id, start, end, dept_id, format)

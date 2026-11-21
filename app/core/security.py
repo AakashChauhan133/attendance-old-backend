@@ -8,6 +8,9 @@ from datetime import datetime, timedelta
 import uuid
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()  # make sure .env is applied before SECRET_KEY etc. are read below
 
 logger = logging.getLogger(__name__)
 

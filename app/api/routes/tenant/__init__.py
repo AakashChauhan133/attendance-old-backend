@@ -8,5 +8,6 @@ from app.api.routes.tenant import (
     devices,  # ✅ Make sure this is included
     org_admins,
     reports,
-    settings
+    settings,
+    activity,
 )

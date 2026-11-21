@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import text, func
@@ -6,7 +6,8 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime, timedelta
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin, verify_device
+from app.api.routes.attendance import mark_attendance
 from app.models.domain import Tenant, Device, Command, User
 from app.mqtt.client import mqtt_manager
 
@@ -69,94 +70,13 @@ async def check_and_update_device_status(device: Device, db: AsyncSession):
 @router.post("/device/mark")
 async def device_mark_attendance(
     finger_id: int,
-    device_id: str = Header(..., alias="x-device-id"),
-    secret_key: str = Header(..., alias="x-secret-key"),
+    background_tasks: BackgroundTasks,
+    device = Depends(verify_device),
     db: AsyncSession = Depends(get_db)
 ):
-    """ESP Device calls this when fingerprint is detected"""
-    
-    # Verify device exists and credentials are correct
-    result = await db.execute(
-        select(Device).where(
-            Device.device_id == device_id,
-            Device.secret_key == secret_key
-        )
-    )
-    device = result.scalars().first()
-    
-    if not device:
-        raise HTTPException(401, "Invalid device credentials")
-    
-    # Update device status to online and update last_seen
-    device.status = "online"
-    device.last_seen = func.now()
-    
-    # Find user by fingerprint ID
-    user_result = await db.execute(
-        select(User).where(
-            User.tenant_id == device.tenant_id,
-            User.finger_id == finger_id,
-            User.is_active == True
-        )
-    )
-    user = user_result.scalars().first()
-    
-    if not user:
-        await db.commit()
-        return {
-            "success": False,
-            "message": "User not found or inactive",
-            "record_type": "DENIED",
-            "user_name": "Unknown",
-            "finger_id": finger_id
-        }
-    
-    # Determine if IN or OUT based on last attendance
-    last_attendance = await db.execute(
-        text("""
-            SELECT record_type, created_at
-            FROM attendance
-            WHERE user_id = :user_id
-            AND DATE(created_at) = CURRENT_DATE
-            ORDER BY created_at DESC
-            LIMIT 1
-        """),
-        {"user_id": user.id}
-    )
-    
-    last_record = last_attendance.mappings().first()
-    
-    # Determine record type
-    if not last_record or last_record["record_type"] == "OUT":
-        record_type = "IN"
-        message = f"Welcome {user.full_name}"
-    else:
-        record_type = "OUT"
-        message = f"Goodbye {user.full_name}"
-    
-    # Create attendance record
-    await db.execute(
-        text("""
-            INSERT INTO attendance (user_id, tenant_id, record_type, device_id, created_at)
-            VALUES (:user_id, :tenant_id, :record_type, :device_id, NOW())
-        """),
-        {
-            "user_id": user.id,
-            "tenant_id": device.tenant_id,
-            "record_type": record_type,
-            "device_id": device_id
-        }
-    )
-    
-    await db.commit()
-    
-    return {
-        "success": True,
-        "message": message,
-        "record_type": record_type,
-        "user_name": user.full_name,
-        "finger_id": finger_id
-    }
+    """ESP device punch (legacy path). Same behaviour as POST /api/device/mark - the old implementation of
+    this route queried a non-existent "attendance" table and could never succeed."""
+    return await mark_attendance(finger_id, background_tasks, device, db)
 
 
 @router.post("/device/heartbeat")
@@ -233,7 +153,7 @@ async def device_update_status(
 @router.post("/devices")
 async def create_device(
     data: DeviceCreate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Register a new biometric device"""
@@ -279,7 +199,7 @@ async def create_device(
 
 @router.get("/devices")
 async def list_devices(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: List all devices in organization"""
@@ -300,10 +220,57 @@ async def list_devices(
     ]
 
 
+# NOTE: fixed-path routes (/devices/status ...) must be declared BEFORE "/devices/{device_id}" or the
+# path parameter swallows "status" and the dashboard gets "Device not found".
+@router.get("/devices/status")
+@router.get("/devices/status/summary")
+async def devices_status(
+    tenant: Tenant = Depends(require_tenant_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get devices status summary with automatic stale detection"""
+    
+    # Mark devices as offline if no heartbeat for 2 minutes
+    stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
+    
+    await db.execute(
+        text("""
+            UPDATE devices 
+            SET status = 'offline'
+            WHERE tenant_id = :tenant_id
+            AND status = 'online'
+            AND (last_seen IS NULL OR last_seen < :cutoff)
+        """),
+        {"tenant_id": tenant.id, "cutoff": stale_cutoff}
+    )
+    await db.commit()
+    
+    # Get updated statistics
+    result = await db.execute(
+        text("""
+            SELECT 
+                COUNT(*) as total,
+                COUNT(*) FILTER (WHERE status = 'online') as online,
+                COUNT(*) FILTER (WHERE status != 'online') as offline
+            FROM devices
+            WHERE tenant_id = :tenant_id
+        """),
+        {"tenant_id": tenant.id}
+    )
+    
+    stats = result.mappings().first()
+    
+    return {
+        "total": stats["total"] or 0,
+        "online": stats["online"] or 0,
+        "offline": stats["offline"] or 0
+    }
+
+
 @router.get("/devices/{device_id}")
 async def get_device(
     device_id: str,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Get device details"""
@@ -346,7 +313,7 @@ async def get_device(
 async def update_device(
     device_id: str,
     data: DeviceUpdate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Update device details"""
@@ -394,7 +361,7 @@ async def update_device(
 @router.delete("/devices/{device_id}")
 async def delete_device(
     device_id: str,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Delete a device"""
@@ -422,56 +389,11 @@ async def delete_device(
     return {"message": "Device deleted successfully"}
 
 
-@router.get("/devices/status")
-@router.get("/devices/status/summary")
-async def devices_status(
-    tenant: Tenant = Depends(verify_tenant_api_key),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get devices status summary with automatic stale detection"""
-    
-    # Mark devices as offline if no heartbeat for 2 minutes
-    stale_cutoff = datetime.utcnow() - timedelta(minutes=2)
-    
-    await db.execute(
-        text("""
-            UPDATE devices 
-            SET status = 'offline'
-            WHERE tenant_id = :tenant_id
-            AND status = 'online'
-            AND (last_seen IS NULL OR last_seen < :cutoff)
-        """),
-        {"tenant_id": tenant.id, "cutoff": stale_cutoff}
-    )
-    await db.commit()
-    
-    # Get updated statistics
-    result = await db.execute(
-        text("""
-            SELECT 
-                COUNT(*) as total,
-                COUNT(*) FILTER (WHERE status = 'online') as online,
-                COUNT(*) FILTER (WHERE status != 'online') as offline
-            FROM devices
-            WHERE tenant_id = :tenant_id
-        """),
-        {"tenant_id": tenant.id}
-    )
-    
-    stats = result.mappings().first()
-    
-    return {
-        "total": stats["total"] or 0,
-        "online": stats["online"] or 0,
-        "offline": stats["offline"] or 0
-    }
-
-
 @router.patch("/devices/{device_id}/status")
 async def update_device_status(
     device_id: str,
     status: str,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Update device online/offline status (called by device heartbeat)"""
@@ -507,7 +429,7 @@ async def update_device_status(
 @router.post("/devices/fire-command")
 async def fire_device_command(
     data: FireCommandRequest,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Send command to device (enroll/delete fingerprint)"""
@@ -598,7 +520,7 @@ async def fire_device_command(
 @router.post("/devices/bulk/status")
 async def get_devices_bulk_status(
     device_ids: List[str],
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Get status for multiple devices at once"""

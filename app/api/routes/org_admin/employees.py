@@ -9,7 +9,7 @@ import string
 from app.db.session import get_db
 from app.api.dependencies import get_current_user, require_role
 from app.models.domain import User, Notification
-from app.core.security import hash_password
+from app.core.security import hash_password, validate_password_strength
 
 router = APIRouter()
 
@@ -221,18 +221,20 @@ async def create_employee(
         data.employee_code = f"EMP{tenant_id}{emp_count + 1:03d}"
         auto_generated["employee_code"] = True
     
-    # Check employee_code unique
+    # Check employee_code unique across the WHOLE platform: login identifies a person by employee code alone,
+    # so the same code in two organizations would make one of them unable to sign in.
     existing = await db.execute(
-        select(User).where(
-            User.tenant_id == tenant_id,
-            User.employee_code == data.employee_code
-        )
+        select(User).where(func.lower(User.employee_code) == data.employee_code.lower())
     )
     if existing.scalars().first():
         raise HTTPException(400, "Employee code already exists")
     
     # AUTO-GENERATE password
     original_password = data.password
+    if data.password:
+        ok, msg = validate_password_strength(data.password)
+        if not ok:
+            raise HTTPException(400, msg)
     if not data.password:
         original_password = generate_strong_password(10)
         auto_generated["password"] = True

@@ -274,6 +274,253 @@ async def get_monthly_stats(
     }
 
 
+# NOTE: the fixed-path routes below (calendar, export, hours/summary) must stay above
+# "/attendance/{date_str}" so they are matched before the catch-all date route.
+
+_IST_SQL = "(timestamp AT TIME ZONE 'Asia/Kolkata')::date"
+
+
+def _month_bounds(month: Optional[int], year: Optional[int]):
+    """Validate month/year (defaults to the current IST month) and return (month, year, first, last)."""
+    import pytz
+    from calendar import monthrange
+
+    now = datetime.now(pytz.timezone("Asia/Kolkata"))
+    month = month or now.month
+    year = year or now.year
+    if not 1 <= month <= 12:
+        raise HTTPException(400, "month must be between 1 and 12")
+    if not 2000 <= year <= 2100:
+        raise HTTPException(400, "year must be between 2000 and 2100")
+    return month, year, date(year, month, 1), date(year, month, monthrange(year, month)[1])
+
+
+async def _daily_records(db: AsyncSession, user_id: int, start: date, end: date):
+    """One row per IST date with first IN and last OUT for a user in [start, end]."""
+    result = await db.execute(text(f"""
+        SELECT
+            {_IST_SQL} AS attendance_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') AS check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') AS check_out
+        FROM attendance_logs
+        WHERE user_id = :user_id
+          AND {_IST_SQL} BETWEEN :start AND :end
+        GROUP BY 1
+        ORDER BY 1
+    """), {"user_id": user_id, "start": start, "end": end})
+    return result.mappings().all()
+
+
+@router.get("/attendance/hours/summary")
+async def get_hours_summary(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Working-hours summary for a month (defaults to the current month)"""
+
+    month, year, first, last = _month_bounds(month, year)
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    rows = await _daily_records(db, current_user.id, first, last)
+
+    days = []
+    total_hours = 0.0
+    total_lost = 0.0
+    met_min_days = 0
+    for row in rows:
+        if not row["check_in"]:
+            continue
+        valid, actual, lost, met_min, status_msg = calculate_valid_working_hours(
+            row["check_in"], row["check_out"], settings
+        )
+        is_late, _ = calculate_late_status(row["check_in"], settings)
+        total_hours += valid
+        total_lost += lost
+        met_min_days += 1 if met_min else 0
+        days.append({
+            "date": row["attendance_date"],
+            "check_in": row["check_in"],
+            "check_out": row["check_out"],
+            "hours_worked": round(valid, 2),
+            "actual_duration": round(actual, 2),
+            "lost_hours": round(lost, 2),
+            "met_min_hours": met_min,
+            "is_late": is_late,
+            "status_message": status_msg
+        })
+
+    present = len(days)
+    return {
+        "month": month,
+        "year": year,
+        "min_working_hours": settings["min_working_hours"],
+        "days_present": present,
+        "days_met_min_hours": met_min_days,
+        "total_hours": round(total_hours, 2),
+        "total_lost_hours": round(total_lost, 2),
+        "average_hours_per_day": round(total_hours / present, 2) if present else 0,
+        "days": days
+    }
+
+
+@router.get("/attendance/calendar")
+async def get_attendance_calendar(
+    month: Optional[int] = None,
+    year: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Month calendar with a status per day
+    (present | late | absent | leave | holiday | weekend | upcoming)"""
+
+    import pytz
+    from datetime import timedelta
+    from app.services.tenant_settings_service import is_working_day
+
+    month, year, first, last = _month_bounds(month, year)
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    today = datetime.now(pytz.timezone("Asia/Kolkata")).date()
+
+    records = {r["attendance_date"]: r for r in await _daily_records(db, current_user.id, first, last)}
+
+    holiday_rows = await db.execute(text("""
+        SELECT holiday_date::date AS day, name
+        FROM holidays
+        WHERE tenant_id = :tenant_id AND holiday_date::date BETWEEN :start AND :end
+    """), {"tenant_id": current_user.tenant_id, "start": first, "end": last})
+    holidays = {r["day"]: r["name"] for r in holiday_rows.mappings().all()}
+
+    leave_rows = await db.execute(text("""
+        SELECT start_date::date AS start_day, end_date::date AS end_day, leave_type
+        FROM leaves
+        WHERE employee_id = :user_id
+          AND status = 'approved'
+          AND end_date::date >= :start AND start_date::date <= :end
+    """), {"user_id": current_user.id, "start": first, "end": last})
+    leaves = leave_rows.mappings().all()
+
+    def leave_on(d):
+        for lv in leaves:
+            if lv["start_day"] <= d <= lv["end_day"]:
+                return lv["leave_type"]
+        return None
+
+    days = []
+    summary = {"present": 0, "late": 0, "absent": 0, "leave": 0, "holiday": 0, "weekend": 0}
+    d = first
+    while d <= last:
+        rec = records.get(d)
+        entry = {"date": d, "day": d.day, "weekday": d.strftime("%a"),
+                 "check_in": None, "check_out": None, "hours_worked": 0, "note": None}
+
+        if rec and rec["check_in"]:
+            valid, _, _, met_min, _ = calculate_valid_working_hours(rec["check_in"], rec["check_out"], settings)
+            is_late, _ = calculate_late_status(rec["check_in"], settings)
+            entry.update({"check_in": rec["check_in"], "check_out": rec["check_out"],
+                          "hours_worked": round(valid, 2), "met_min_hours": met_min})
+            entry["status"] = "late" if is_late else "present"
+        elif d in holidays:
+            entry["status"] = "holiday"
+            entry["note"] = holidays[d]
+        elif leave_on(d):
+            entry["status"] = "leave"
+            entry["note"] = leave_on(d)
+        elif not is_working_day(d, settings):
+            entry["status"] = "weekend"
+        elif d > today:
+            entry["status"] = "upcoming"
+        elif d == today:
+            entry["status"] = "upcoming"  # day not finished and no check-in yet
+        else:
+            entry["status"] = "absent"
+
+        if entry["status"] in summary:
+            summary[entry["status"]] += 1
+        # a late day is still a day present
+        if entry["status"] == "late":
+            summary["present"] += 1
+        days.append(entry)
+        d += timedelta(days=1)
+
+    return {"month": month, "year": year, "summary": summary, "days": days}
+
+
+@router.get("/attendance/export")
+async def export_attendance(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    format: str = "json",
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Employee: Export own attendance (JSON by default, ?format=csv for a CSV download).
+    Optional ?start_date= and ?end_date= (YYYY-MM-DD); defaults to all records."""
+
+    from fastapi import Response
+
+    if format not in ("json", "csv"):
+        raise HTTPException(400, "format must be 'json' or 'csv'")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(400, "start_date must not be after end_date")
+
+    settings = await get_tenant_settings(current_user.tenant_id, db)
+    result = await db.execute(text(f"""
+        SELECT
+            {_IST_SQL} AS attendance_date,
+            MIN(timestamp) FILTER (WHERE record_type = 'IN') AS check_in,
+            MAX(timestamp) FILTER (WHERE record_type = 'OUT') AS check_out
+        FROM attendance_logs
+        WHERE user_id = :user_id
+          AND (CAST(:start AS DATE) IS NULL OR {_IST_SQL} >= CAST(:start AS DATE))
+          AND (CAST(:end AS DATE) IS NULL OR {_IST_SQL} <= CAST(:end AS DATE))
+        GROUP BY 1
+        ORDER BY 1 DESC
+    """), {"user_id": current_user.id, "start": start_date, "end": end_date})
+
+    records = []
+    for row in result.mappings().all():
+        if row["check_in"]:
+            valid, _, _, met_min, _ = calculate_valid_working_hours(row["check_in"], row["check_out"], settings)
+            is_late, _ = calculate_late_status(row["check_in"], settings)
+        else:
+            valid, met_min, is_late = 0, False, False
+        records.append({
+            "date": row["attendance_date"],
+            "check_in": row["check_in"],
+            "check_out": row["check_out"],
+            "hours_worked": round(valid, 2),
+            "met_min_hours": met_min,
+            "is_late": is_late,
+            "status": "present" if row["check_in"] else "absent"
+        })
+
+    if format == "csv":
+        import csv
+        import io
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["date", "check_in", "check_out", "hours_worked", "met_min_hours", "is_late", "status"])
+        for r in records:
+            writer.writerow([r["date"], r["check_in"], r["check_out"], r["hours_worked"],
+                             r["met_min_hours"], r["is_late"], r["status"]])
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="attendance.csv"'}
+        )
+
+    return {
+        "employee": {
+            "id": current_user.id,
+            "name": current_user.name,
+            "employee_code": current_user.employee_code
+        },
+        "total_records": len(records),
+        "records": records
+    }
+
+
 @router.get("/attendance/{date_str}")
 async def get_attendance_by_date(
     date_str: str,

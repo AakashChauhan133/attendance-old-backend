@@ -1,14 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import text
+from sqlalchemy import text, func
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 import secrets
 import string
 
 from app.db.session import get_db
-from app.api.dependencies import verify_tenant_api_key
+from app.api.dependencies import require_tenant_admin
 from app.models.domain import Tenant, Department, User
 from app.core.security import hash_password
 
@@ -48,7 +48,7 @@ class OrgAdminUpdate(BaseModel):
 
 @router.get("/org-admins")
 async def list_org_admins(
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: List all org admins"""
@@ -78,7 +78,7 @@ async def list_org_admins(
 @router.post("/org-admins")
 async def create_org_admin(
     data: OrgAdminCreate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Create org admin - just name, email, department. Password auto-generated."""
@@ -96,7 +96,7 @@ async def create_org_admin(
     
     # Check email unique (username)
     existing = await db.execute(
-        select(User).where(User.email == data.email)
+        select(User).where(func.lower(User.email) == data.email.lower())
     )
     if existing.scalars().first():
         raise HTTPException(400, "Email already exists")
@@ -108,7 +108,7 @@ async def create_org_admin(
     org_admin = User(
         tenant_id=tenant.id,
         name=data.name,
-        email=data.email,
+        email=data.email.lower(),
         password_hash=hash_password(auto_password),
         dept_id=data.dept_id,
         role="org_admin",
@@ -142,7 +142,7 @@ async def create_org_admin(
 async def update_org_admin(
     admin_id: int,
     data: OrgAdminUpdate,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Update org admin"""
@@ -184,7 +184,7 @@ async def update_org_admin(
 @router.delete("/org-admins/{admin_id}")
 async def delete_org_admin(
     admin_id: int,
-    tenant: Tenant = Depends(verify_tenant_api_key),
+    tenant: Tenant = Depends(require_tenant_admin),
     db: AsyncSession = Depends(get_db)
 ):
     """Tenant Manager: Deactivate org admin"""
